@@ -1,0 +1,171 @@
+import { Button, CheckBox, Switch, Slider, ComboBox, ScrollView, Palette } from "std-widgets.slint";
+
+component Card inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle;
+    background: Palette.control-background;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Palette.border;
+    VerticalLayout {
+        padding: 16px;
+        spacing: 10px;
+        Text { text: root.title; font-size: 15px; font-weight: 600; }
+        if root.subtitle != "": Text { text: root.subtitle; font-size: 12px; color: Palette.foreground.with-alpha(0.65); wrap: word-wrap; }
+        @children
+    }
+}
+
+component Row inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> hint;
+    spacing: 16px;
+    VerticalLayout {
+        alignment: center;
+        horizontal-stretch: 1;
+        Text { text: root.label; font-size: 14px; }
+        if root.hint != "": Text { text: root.hint; font-size: 12px; color: Palette.foreground.with-alpha(0.6); wrap: word-wrap; }
+    }
+    @children
+}
+
+component DbSlider inherits HorizontalLayout {
+    in-out property <float> value;
+    in property <float> minimum;
+    in property <float> maximum;
+    callback edited();
+    spacing: 8px;
+    Slider {
+        width: 200px; minimum: root.minimum; maximum: root.maximum; value <=> root.value;
+        changed(v) => { root.value = round(v); root.edited(); }
+    }
+    Text { width: 56px; vertical-alignment: center; horizontal-alignment: right; text: round(root.value) + " dB"; }
+}
+
+/// Checkboxes laid out in a fixed grid (Slint has no wrapping layout).
+component ToggleGrid inherits Rectangle {
+    in property <[string]> labels;
+    in-out property <[bool]> values;
+    in property <int> columns: 4;
+    in property <length> cell-width: 110px;
+    callback edited();
+    height: ceil(root.labels.length / root.columns) * 32px;
+    for label[i] in root.labels: CheckBox {
+        x: mod(i, root.columns) * root.cell-width;
+        y: floor(i / root.columns) * 32px;
+        width: root.cell-width;
+        text: label;
+        checked: root.values[i];
+        toggled => { root.values[i] = self.checked; root.edited(); }
+    }
+}
+
+export component SettingsWindow inherits Window {
+    title: "VMVolume settings";
+    icon: @image-url("icon.png");
+    preferred-width: 560px;
+    preferred-height: 720px;
+    min-width: 480px;
+    min-height: 400px;
+
+    in property <string> version;
+    in property <string> status;
+    in property <string> curve-preview;
+    in-out property <float> gain-min;
+    in-out property <float> gain-max;
+    in-out property <bool> limit-0;
+    in-out property <bool> linear;
+    in-out property <bool> sync-mute;
+    in-out property <bool> block-spikes;
+    in-out property <[bool]> strips;
+    in-out property <[bool]> buses;
+    in-out property <int> priority;
+    in-out property <[bool]> cores;
+    in property <[string]> core-labels;
+    in property <string> audiodg-status;
+    in property <bool> is-admin;
+    in-out property <bool> start-with-windows;
+    in-out property <bool> start-as-admin;
+    in-out property <bool> auto-update;
+    in property <string> update-status;
+
+    callback changed();
+    callback restart-as-admin();
+    callback check-update();
+    callback reset-affinity();
+
+    ScrollView {
+        VerticalLayout {
+            padding: 20px;
+            spacing: 14px;
+
+            HorizontalLayout {
+                spacing: 12px;
+                Image { source: @image-url("icon.png"); width: 40px; height: 40px; }
+                VerticalLayout {
+                    alignment: center;
+                    Text { text: "VMVolume " + root.version; font-size: 18px; font-weight: 700; }
+                    Text { text: root.status; font-size: 12px; color: Palette.foreground.with-alpha(0.7); wrap: word-wrap; }
+                }
+            }
+
+            Card {
+                title: "Volume range";
+                subtitle: "Where the Windows volume knob lands in Voicemeeter.";
+                Row { label: "Lowest gain"; hint: "Knob at 0%"; DbSlider { minimum: -60; maximum: 0; value <=> root.gain-min; edited => { root.changed(); } } }
+                Row { label: "Highest gain"; hint: "Knob at 100%"; DbSlider { minimum: -12; maximum: 12; value <=> root.gain-max; edited => { root.changed(); } } }
+                Row { label: "Never go above 0 dB"; hint: "Caps the top of the knob at 0 dB, so it never boosts"; Switch { checked <=> root.limit-0; toggled => { root.changed(); } } }
+                Row { label: "Linear curve"; hint: "Off = logarithmic, which feels even across the knob"; Switch { checked <=> root.linear; toggled => { root.changed(); } } }
+                Text { text: root.curve-preview; font-size: 12px; color: Palette.foreground.with-alpha(0.65); }
+            }
+
+            Card {
+                title: "Controlled by the knob";
+                subtitle: "Every ticked strip and bus follows the Windows volume.";
+                Text { text: "Inputs (strips)"; font-size: 13px; font-weight: 600; }
+                ToggleGrid { labels: ["In 1", "In 2", "In 3", "In 4", "In 5", "VAIO", "AUX", "VAIO3"]; values <=> root.strips; edited => { root.changed(); } }
+                Text { text: "Outputs (buses)"; font-size: 13px; font-weight: 600; }
+                ToggleGrid { labels: ["A1", "A2", "A3", "A4", "A5", "B1", "B2", "B3"]; values <=> root.buses; edited => { root.changed(); } }
+            }
+
+            Card {
+                title: "Behaviour";
+                Row { label: "Sync mute"; hint: "Muting Windows mutes the ticked strips and buses"; Switch { checked <=> root.sync-mute; toggled => { root.changed(); } } }
+                Row { label: "Block sudden 100% jumps"; hint: "Windows sometimes resets volume to 100% when a device connects; put it back"; Switch { checked <=> root.block-spikes; toggled => { root.changed(); } } }
+            }
+
+            Card {
+                title: "audiodg.exe";
+                subtitle: "The Windows audio engine process. Higher priority or pinning it to one core can stop crackling. Needs administrator.";
+                Row {
+                    label: "Priority";
+                    ComboBox { width: 160px; model: ["Don't change", "Normal", "Above normal", "High", "Realtime"]; current-index <=> root.priority; selected => { root.changed(); } }
+                }
+                Text { text: "CPU cores (none ticked = don't change)"; font-size: 13px; }
+                ToggleGrid { labels: root.core-labels; values <=> root.cores; columns: 6; cell-width: 80px; edited => { root.changed(); } }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: root.audiodg-status; font-size: 12px; color: Palette.foreground.with-alpha(0.7); vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1; }
+                    Button { text: "Clear cores"; clicked => { root.reset-affinity(); } }
+                    if !root.is-admin: Button { text: "Restart as administrator"; clicked => { root.restart-as-admin(); } }
+                }
+            }
+
+            Card {
+                title: "Startup";
+                Row { label: "Start with Windows"; Switch { checked <=> root.start-with-windows; toggled => { root.changed(); } } }
+                Row { label: "Run as administrator"; hint: "Starts elevated at logon (scheduled task) so the audiodg settings apply. Asks for UAC once when changed."; Switch { enabled: root.start-with-windows; checked <=> root.start-as-admin; toggled => { root.changed(); } } }
+            }
+
+            Card {
+                title: "Updates";
+                Row { label: "Update automatically"; hint: "Checks GitHub every 6 hours and swaps in the new exe"; Switch { checked <=> root.auto-update; toggled => { root.changed(); } } }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: root.update-status; font-size: 12px; color: Palette.foreground.with-alpha(0.7); vertical-alignment: center; horizontal-stretch: 1; wrap: word-wrap; }
+                    Button { text: "Check now"; clicked => { root.check-update(); } }
+                }
+            }
+        }
+    }
+}
