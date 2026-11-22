@@ -2,7 +2,7 @@
 name = "vmvolume"
 version = "0.2.0"
 edition = "2021"
-license = "MIT"
+license = "GPL-3.0-only"
 description = "Sync the Windows volume knob to Voicemeeter strip/bus gain"
 repository = "https://github.com/awan-gh/VMVolume"
 build = "build.rs"

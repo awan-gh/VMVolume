@@ -35,4 +35,4 @@ Voicemeeter install folder at runtime.
 
 ## License
 
-MIT. Voicemeeter is a product of VB-Audio; this project is not affiliated with VB-Audio.
+[GPL-3.0](LICENSE). Voicemeeter is a product of VB-Audio; this project is not affiliated with VB-Audio.
