@@ -32,6 +32,7 @@ const WM_TRAY: u32 = WM_APP + 1;
 const WM_VOL: u32 = WM_APP + 2; // new value is in VOL_* atomics
 const WM_REBIND: u32 = WM_APP + 3; // default playback device changed
 const WM_DEVEVENT: u32 = WM_APP + 4; // any audio device added/removed/state change
+const WM_SHOW_SETTINGS: u32 = WM_APP + 5; // sent by a second launch
 const TIMER_TICK: usize = 1;
 const ID_SETTINGS: usize = 10;
 const ID_QUIT: usize = 11;
@@ -45,6 +46,15 @@ static VOL_MUTED: AtomicBool = AtomicBool::new(false);
 fn post(msg: u32) {
     let h = HWND(MAIN_HWND.load(Ordering::Relaxed) as _);
     unsafe { let _ = PostMessageW(Some(h), msg, WPARAM(0), LPARAM(0)); }
+}
+
+/// Append a line to %APPDATA%\VMVolumemvolume.log (reset when it passes 256 KB).
+pub fn log(msg: &str) {
+    use std::io::Write;
+    let p = settings::dir().join("vmvolume.log");
+    if std::fs::metadata(&p).map(|m| m.len() > 256 * 1024).unwrap_or(false) { let _ = std::fs::remove_file(&p); }
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) { let _ = writeln!(f, "{t} {msg}"); }
 }
 
 pub fn trim_memory() {
@@ -228,7 +238,8 @@ impl App {
             Some(vm) => vm.connected() || { vm.relogin(); vm.connected() },
             None => false,
         };
-        if now && !self.connected { self.vm_name = self.vm.as_ref().unwrap().name(); self.connected = true; self.sent = None; }
+        if now && !self.connected { self.vm_name = self.vm.as_ref().unwrap().name(); self.connected = true; self.sent = None; log(&format!("connected to {}", self.vm_name)); }
+        if !now && self.connected { log("lost Voicemeeter connection"); }
         self.connected = now;
         // catch up on a volume message that was dropped while another handler ran
         self.on_volume(false);
@@ -272,6 +283,7 @@ impl App {
     pub fn apply_audiodg(&mut self) {
         self.audiodg_pid = sys::audiodg_pid();
         self.audiodg_status = match sys::apply_audiodg(self.s.audiodg_priority, self.s.audiodg_affinity) { Ok(s) => s, Err(e) => e };
+        log(&format!("audiodg: {}", self.audiodg_status));
         self.refresh_ui();
     }
 
@@ -302,6 +314,7 @@ pub fn start_update_check(a: &mut App, manual: bool) {
         let _ = slint::invoke_from_event_loop(move || {
             with_app(|a| {
                 a.updating = false;
+                log(&format!("update check: {}", match &result { Ok(None) => "up to date".into(), Ok(Some(v)) => format!("installed {v}"), Err(e) => e.clone() }));
                 let when = "just now";
                 a.update_status = match &result {
                     Ok(None) => format!("Up to date ({}), checked {when}", env!("CARGO_PKG_VERSION")),
@@ -355,6 +368,7 @@ extern "system" fn wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
             WM_VOL => { with_app(|a| a.on_volume(true)); LRESULT(0) }
             WM_DEVEVENT => { with_app(|a| a.last_dev_event = Instant::now()); LRESULT(0) }
             WM_REBIND => { with_app(|a| a.rebind()); LRESULT(0) }
+            WM_SHOW_SETTINGS => { let _ = slint::invoke_from_event_loop(ui::open); LRESULT(0) }
             WM_TIMER if w.0 == TIMER_TICK => { with_app(|a| a.tick()); LRESULT(0) }
             WM_TRAY => {
                 match l.0 as u32 & 0xFFFF {
@@ -381,7 +395,13 @@ extern "system" fn wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
 
 fn main() -> Result<()> {
     let takeover = std::env::args().any(|a| a == "--takeover");
-    let Some(_mutex) = sys::single_instance(takeover) else { return Ok(()) };
+    let Some(_mutex) = sys::single_instance(takeover) else {
+        // already running: launching the exe again opens its settings
+        unsafe {
+            if let Ok(h) = FindWindowW(w!("VMVolumeWnd"), None) { let _ = PostMessageW(Some(h), WM_SHOW_SETTINGS, WPARAM(0), LPARAM(0)); }
+        }
+        return Ok(());
+    };
     update::cleanup();
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
@@ -391,14 +411,20 @@ fn main() -> Result<()> {
         // A hidden top-level window (not message-only) so it receives the TaskbarCreated broadcast.
         let h = CreateWindowExW(Default::default(), w!("VMVolumeWnd"), w!("VMVolume"), WS_OVERLAPPED, 0, 0, 0, 0, None, None, Some(inst.into()), None)?;
         MAIN_HWND.store(h.0 as isize, Ordering::Relaxed);
+        // let a non-elevated second launch reach an elevated instance
+        let _ = ChangeWindowMessageFilterEx(h, WM_SHOW_SETTINGS, MSGFLT_ALLOW, None);
         let _ = TASKBAR_CREATED.set(RegisterWindowMessageW(w!("TaskbarCreated")));
 
         let s = Settings::load();
+        log(&format!("start {} admin={}", env!("CARGO_PKG_VERSION"), sys::is_admin()));
         // keep the plain startup entry pointing at this exe if it moved (the elevated task is only touched from settings)
-        if s.start_with_windows && !s.start_as_admin && !std::env::current_exe().unwrap_or_default().components().any(|c| c.as_os_str() == "target") {
+        if s.start_with_windows && !s.start_as_admin {
             sys::apply_startup(true, false);
         }
-        let mut audio = Audio::new()?;
+        // Right after logon the audio service can still be starting: retry instead of quitting.
+        let mut audio = loop {
+            match Audio::new() { Ok(a) => break a, Err(_) => std::thread::sleep(Duration::from_secs(2)) }
+        };
         let (volume, muted) = audio.bind().unwrap_or((1.0, false));
         VOL_SCALAR.store(volume.to_bits(), Ordering::Relaxed);
         VOL_MUTED.store(muted, Ordering::Relaxed);
@@ -411,7 +437,6 @@ fn main() -> Result<()> {
         with_app(|a| {
             tray(h, NIM_ADD, "VMVolume");
             a.tick();
-            if a.s.audiodg_priority != 0 || a.s.audiodg_affinity != 0 { a.apply_audiodg(); }
             a.refresh_ui();
         });
         SetTimer(Some(h), TIMER_TICK, 2000, None);

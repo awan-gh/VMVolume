@@ -3,7 +3,7 @@ use windows::{
     core::*,
     Win32::{
         Foundation::*,
-        Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY},
+        Security::{AdjustTokenPrivileges, GetTokenInformation, LookupPrivilegeValueW, TokenElevation, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_ELEVATION, TOKEN_PRIVILEGES, TOKEN_QUERY},
         System::{Diagnostics::ToolHelp::*, Registry::*, Threading::*},
         UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_HIDE},
     },
@@ -41,6 +41,8 @@ fn shell(verb: PCWSTR, file: &str, args: &str) -> bool {
     unsafe { ShellExecuteW(None, verb, PCWSTR(f.as_ptr()), PCWSTR(a.as_ptr()), None, SW_HIDE).0 as isize > 32 }
 }
 
+pub fn is_dev_build() -> bool { std::env::current_exe().unwrap_or_default().components().any(|c| c.as_os_str() == "target") }
+
 fn exe() -> String { std::env::current_exe().unwrap_or_default().display().to_string() }
 
 /// Relaunch this exe elevated (UAC prompt); caller quits on success.
@@ -66,13 +68,29 @@ pub fn audiodg_pid() -> Option<u32> {
     }
 }
 
+/// audiodg runs as LOCAL SERVICE: even an elevated token needs SeDebugPrivilege switched on to modify it.
+fn enable_debug_privilege() {
+    unsafe {
+        let mut tok = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut tok).is_err() { return; }
+        let mut tp = TOKEN_PRIVILEGES { PrivilegeCount: 1, Privileges: [LUID_AND_ATTRIBUTES { Attributes: SE_PRIVILEGE_ENABLED, ..Default::default() }] };
+        if LookupPrivilegeValueW(None, w!("SeDebugPrivilege"), &mut tp.Privileges[0].Luid).is_ok() {
+            let _ = AdjustTokenPrivileges(tok, false, Some(&tp), 0, None, None);
+        }
+        let _ = CloseHandle(tok);
+    }
+}
+
 /// Apply priority/affinity to audiodg.exe. Err text is shown in the settings window.
 pub fn apply_audiodg(priority: u32, affinity: u64) -> std::result::Result<String, String> {
     if priority == 0 && affinity == 0 { return Ok("not changed".into()); }
     let pid = audiodg_pid().ok_or("audiodg.exe is not running")?;
+    if is_admin() { enable_debug_privilege(); }
     unsafe {
-        let h = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
-            .map_err(|_| "needs administrator: turn on \"Run as administrator\" below".to_string())?;
+        let h = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, false, pid).map_err(|e| {
+            if is_admin() { format!("Windows refused access to audiodg.exe: {}", e.message()) }
+            else { "needs administrator: turn on \"Run as administrator\" below".to_string() }
+        })?;
         let mut err = None;
         if priority != 0 && SetPriorityClass(h, PROCESS_CREATION_FLAGS(priority)).is_err() { err = Some("could not set priority"); }
         if affinity != 0 && SetProcessAffinityMask(h, affinity as usize).is_err() { err = Some("could not set affinity (no such core?)"); }
@@ -123,6 +141,7 @@ fn task_xml() -> String {
 /// Make the startup entry match the settings. Creating/removing the elevated task shows one UAC prompt
 /// unless we are already elevated.
 pub fn apply_startup(on: bool, admin: bool) {
+    if is_dev_build() { return; } // a cargo build must never take over the installed copy's startup entries
     let want_task = on && admin;
     set_run_key(on && !admin);
     let has_task = task_exists();
