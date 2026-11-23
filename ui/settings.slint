@@ -79,7 +79,12 @@ export component SettingsWindow inherits Window {
     in-out property <bool> block-spikes;
     in-out property <[bool]> strips;
     in-out property <[bool]> buses;
+    in-out property <[bool]> mute-strips;
+    in-out property <[bool]> mute-buses;
     in-out property <bool> crackle-fix;
+    in-out property <[bool]> engine-buses;
+    in-out property <[bool]> engine-strips;
+    in-out property <bool> engine-on-disconnect;
     in-out property <int> priority;
     in-out property <[bool]> cores;
     in property <[string]> core-labels;
@@ -94,6 +99,7 @@ export component SettingsWindow inherits Window {
     callback restart-as-admin();
     callback check-update();
     callback reset-affinity();
+    callback engine-select-all(bool);
 
     ScrollView {
         VerticalLayout {
@@ -130,8 +136,32 @@ export component SettingsWindow inherits Window {
             }
 
             Card {
+                title: "Restart engine on device change";
+                subtitle: "When the device on a ticked bus or input is plugged back in, restart the Voicemeeter engine so it works again instead of staying red. Only that device counts; nothing restarts while it stays unplugged.";
+                Text { text: "Outputs"; font-size: 13px; font-weight: 600; }
+                ToggleGrid { labels: ["A1", "A2", "A3", "A4", "A5"]; values <=> root.engine-buses; columns: 5; cell-width: 80px; edited => { root.changed(); } }
+                Text { text: "Hardware inputs"; font-size: 13px; font-weight: 600; }
+                ToggleGrid { labels: ["In 1", "In 2", "In 3", "In 4", "In 5"]; values <=> root.engine-strips; columns: 5; cell-width: 80px; edited => { root.changed(); } }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    Button { text: "All"; clicked => { root.engine-select-all(true); } }
+                    Button { text: "None"; clicked => { root.engine-select-all(false); } }
+                }
+                Row { label: "Also restart on unplug"; hint: "Off = only when the device comes back"; Switch { checked <=> root.engine-on-disconnect; toggled => { root.changed(); } } }
+                Text { text: "B1–B3 are virtual buses with no device behind them, so they are not listed."; font-size: 12px; color: Palette.foreground.with-alpha(0.6); wrap: word-wrap; }
+            }
+
+            Card {
                 title: "Behaviour";
-                Row { label: "Sync mute"; hint: "Muting Windows mutes the ticked strips and buses"; Switch { checked <=> root.sync-mute; toggled => { root.changed(); } } }
+                Row { label: "Sync mute"; hint: "Muting Windows mutes the strips and buses ticked below"; Switch { checked <=> root.sync-mute; toggled => { root.changed(); } } }
+                if root.sync-mute: VerticalLayout {
+                    spacing: 10px;
+                    Text { text: "Inputs that follow the mute"; font-size: 13px; font-weight: 600; }
+                    ToggleGrid { labels: ["In 1", "In 2", "In 3", "In 4", "In 5", "VAIO", "AUX", "VAIO3"]; values <=> root.mute-strips; edited => { root.changed(); } }
+                    Text { text: "Outputs that follow the mute"; font-size: 13px; font-weight: 600; }
+                    ToggleGrid { labels: ["A1", "A2", "A3", "A4", "A5", "B1", "B2", "B3"]; values <=> root.mute-buses; edited => { root.changed(); } }
+                }
                 Row { label: "Block sudden 100% jumps"; hint: "Windows sometimes resets volume to 100% when a device connects; put it back"; Switch { checked <=> root.block-spikes; toggled => { root.changed(); } } }
             }
 

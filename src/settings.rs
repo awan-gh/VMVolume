@@ -11,6 +11,8 @@ pub struct Settings {
     /// false = log curve (20*log10, same as Voicemeeter Windows Volume), true = straight line.
     pub linear_volume_scale: bool,
     pub sync_mute: bool,
+    /// Strips/buses that follow the Windows mute; None = the same ones that follow the volume.
+    pub mute_targets: Option<Vec<String>>,
     /// Undo a jump to 100% right after a device change.
     pub block_volume_spikes: bool,
     /// Voicemeeter targets, e.g. "Bus[0]", "Strip[3]".
@@ -21,6 +23,12 @@ pub struct Settings {
     pub audiodg_priority: u32,
     /// audiodg.exe CPU affinity bitmask; 0 = leave alone.
     pub audiodg_affinity: u64,
+    /// Restart the Voicemeeter engine when the device on A1..A5 connects (index 0 = A1).
+    pub engine_restart_buses: Vec<bool>,
+    /// Same for the hardware inputs 1..5 (index 0 = input 1).
+    pub engine_restart_strips: Vec<bool>,
+    /// Also restart when that device disconnects (default: only when it comes back).
+    pub engine_restart_on_disconnect: bool,
     pub start_with_windows: bool,
     /// Start elevated at logon (scheduled task) so the audiodg tweaks can apply.
     pub start_as_admin: bool,
@@ -29,8 +37,9 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            gain_min: -60.0, gain_max: 12.0, limit_db_gain_to_0: true, linear_volume_scale: false, sync_mute: true,
+            gain_min: -60.0, gain_max: 12.0, limit_db_gain_to_0: true, linear_volume_scale: false, sync_mute: true, mute_targets: None,
             block_volume_spikes: true, targets: vec!["Bus[0]".into()], crackle_fix: true, audiodg_priority: 0, audiodg_affinity: 0,
+            engine_restart_buses: vec![false; 5], engine_restart_strips: vec![false; 5], engine_restart_on_disconnect: false,
             start_with_windows: true, start_as_admin: false, auto_update: true,
         }
     }
@@ -63,6 +72,8 @@ impl Settings {
         let tmp = p.with_extension("json.tmp");
         if std::fs::write(&tmp, serde_json::to_string_pretty(self).unwrap()).is_ok() { let _ = std::fs::rename(&tmp, &p); }
     }
+    /// Strips/buses whose mute follows Windows.
+    pub fn mute_set(&self) -> &[String] { self.mute_targets.as_deref().unwrap_or(&self.targets) }
     /// Range the knob actually covers: [gain_min, top].
     pub fn top(&self) -> f32 { if self.limit_db_gain_to_0 { self.gain_max.min(0.0) } else { self.gain_max } }
 }
@@ -147,5 +158,9 @@ mod tests {
         let s: Settings = serde_json::from_str(r#"{"gain_min":-40.0,"targets":["Bus[2]"]}"#).unwrap();
         assert_eq!(s.gain_min, -40.0);
         assert!(s.auto_update && s.crackle_fix);
+        assert_eq!(s.mute_set(), ["Bus[2]"]); // no mute list yet: follows the volume targets
+        let s = Settings { mute_targets: Some(vec!["Strip[0]".into()]), ..s };
+        assert_eq!(s.mute_set(), ["Strip[0]"]);
     }
 }
+

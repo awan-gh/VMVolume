@@ -3,6 +3,7 @@
 //! Event driven (IAudioEndpointVolume callback); the only timer is a 2 s housekeeping tick.
 #![windows_subsystem = "windows"]
 
+mod devices;
 mod settings;
 mod sys;
 mod ui;
@@ -39,6 +40,9 @@ const ID_SETTINGS: usize = 10;
 const ID_QUIT: usize = 11;
 const ID_RESTART_VM: usize = 12;
 const ID_RESTART_AUDIO: usize = 13;
+const ID_RESTART_ENGINE: usize = 14;
+const TIMER_ENGINE: usize = 2; // debounce for device-change engine restarts
+const ENGINE_DEBOUNCE_MS: u32 = 2500;
 const UPDATE_EVERY: Duration = Duration::from_secs(6 * 3600);
 
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -68,6 +72,7 @@ pub fn trim_memory() {
 type FnVoid = unsafe extern "system" fn() -> i32;
 type FnScript = unsafe extern "system" fn(*const i8) -> i32;
 type FnType = unsafe extern "system" fn(*mut i32) -> i32;
+type FnGetS = unsafe extern "system" fn(*const i8, *mut u8) -> i32;
 struct Vm {
     _lib: libloading::Library,
     login: FnVoid,
@@ -75,6 +80,7 @@ struct Vm {
     dirty: FnVoid,
     script: FnScript,
     kind: FnType,
+    get_s: FnGetS,
 }
 impl Vm {
     fn load() -> Option<Vm> {
@@ -88,6 +94,7 @@ impl Vm {
                 dirty: *lib.get::<FnVoid>(b"VBVMR_IsParametersDirty\0").ok()?,
                 script: *lib.get::<FnScript>(b"VBVMR_SetParameters\0").ok()?,
                 kind: *lib.get::<FnType>(b"VBVMR_GetVoicemeeterType\0").ok()?,
+                get_s: *lib.get::<FnGetS>(b"VBVMR_GetParameterStringA\0").ok()?,
                 _lib: lib,
             };
             (vm.login)();
@@ -97,6 +104,12 @@ impl Vm {
     /// True when Voicemeeter is running and answering (IsParametersDirty is negative when not).
     fn connected(&self) -> bool { unsafe { (self.dirty)() >= 0 } }
     fn relogin(&self) { unsafe { (self.logout)(); (self.login)(); } }
+    fn get_string(&self, param: &str) -> String {
+        let c = CString::new(param).unwrap();
+        let mut buf = [0u8; 512];
+        unsafe { if (self.get_s)(c.as_ptr(), buf.as_mut_ptr()) != 0 { return String::new(); } }
+        String::from_utf8_lossy(&buf[..buf.iter().position(|&b| b == 0).unwrap_or(0)]).into_owned()
+    }
     fn name(&self) -> &'static str {
         let mut t = 0;
         unsafe { (self.kind)(&mut t); }
@@ -139,14 +152,20 @@ impl IAudioEndpointVolumeCallback_Impl for VolCb_Impl {
 #[implement(IMMNotificationClient)]
 struct DevCb;
 impl IMMNotificationClient_Impl for DevCb_Impl {
-    fn OnDeviceStateChanged(&self, _: &PCWSTR, _: DEVICE_STATE) -> Result<()> { post(WM_DEVEVENT); Ok(()) }
-    fn OnDeviceAdded(&self, _: &PCWSTR) -> Result<()> { post(WM_DEVEVENT); Ok(()) }
-    fn OnDeviceRemoved(&self, _: &PCWSTR) -> Result<()> { post(WM_DEVEVENT); Ok(()) }
+    fn OnDeviceStateChanged(&self, id: &PCWSTR, state: DEVICE_STATE) -> Result<()> { dev_event(id, state == DEVICE_STATE_ACTIVE); Ok(()) }
+    fn OnDeviceAdded(&self, _: &PCWSTR) -> Result<()> { post(WM_DEVEVENT); Ok(()) } // a state change follows
+    fn OnDeviceRemoved(&self, id: &PCWSTR) -> Result<()> { dev_event(id, false); Ok(()) }
     fn OnDefaultDeviceChanged(&self, flow: EDataFlow, role: ERole, _: &PCWSTR) -> Result<()> {
         if flow == eRender && role == eMultimedia { post(WM_REBIND); }
         Ok(())
     }
     fn OnPropertyValueChanged(&self, _: &PCWSTR, _: &PROPERTYKEY) -> Result<()> { Ok(()) }
+}
+
+fn dev_event(id: &PCWSTR, active: bool) {
+    let id = unsafe { id.to_string().unwrap_or_default() };
+    devices::EVENTS.lock().unwrap().push((id, active));
+    post(WM_DEVEVENT);
 }
 
 struct Audio {
@@ -199,6 +218,9 @@ pub struct App {
     connected: bool,
     vm_name: &'static str,
     last_dev_event: Instant,
+    dev_names: devices::Names,
+    /// why the pending debounced engine restart was scheduled
+    engine_reason: String,
     audiodg_pid: Option<u32>,
     pub audiodg_status: String,
     pub update_status: String,
@@ -224,10 +246,8 @@ impl App {
         let push_mute = self.s.sync_mute && match self.sent { Some((_, m)) => m != self.muted, None => self.muted };
         if self.sent.map(|(sg, _)| sg) != Some(g) || push_mute {
             let mut script = String::new();
-            for t in &self.s.targets {
-                script += &format!("{t}.Gain={g:.1};");
-                if push_mute { script += &format!("{t}.Mute={};", self.muted as i32); }
-            }
+            for t in &self.s.targets { script += &format!("{t}.Gain={g:.1};"); }
+            if push_mute { for t in self.s.mute_set() { script += &format!("{t}.Mute={};", self.muted as i32); } }
             if !script.is_empty() { vm.run(&script); }
         }
         let mute_now = if push_mute { self.muted } else { self.sent.map(|(_, m)| m).unwrap_or(self.muted) };
@@ -316,6 +336,40 @@ impl App {
         });
     }
 
+    pub fn restart_engine(&mut self, why: &str) {
+        let Some(vm) = &self.vm else { return };
+        if !self.connected { return; }
+        vm.run("Command.Restart=1;");
+        self.sent = None; // push the knob position again once the engine is back
+        log(&format!("restarted Voicemeeter engine ({why})"));
+    }
+
+    /// A device connected or disconnected: if it sits on a watched slot (playback devices on A1..A5,
+    /// recording devices on hardware inputs 1..5), restart the engine. Debounced: one plug fires several events.
+    fn on_device_events(&mut self) {
+        self.last_dev_event = Instant::now();
+        let events: Vec<(String, bool)> = std::mem::take(&mut *devices::EVENTS.lock().unwrap());
+        if events.is_empty() || !self.connected { return; }
+        let Some(vm) = &self.vm else { return };
+        let mut watched: Vec<(bool, String, String)> = vec![]; // (playback?, label, Voicemeeter device name)
+        for (i, _) in self.s.engine_restart_buses.iter().enumerate().filter(|(_, &on)| on) {
+            watched.push((true, format!("A{}", i + 1), vm.get_string(&format!("Bus[{i}].device.name"))));
+        }
+        for (i, _) in self.s.engine_restart_strips.iter().enumerate().filter(|(_, &on)| on) {
+            watched.push((false, format!("input {}", i + 1), vm.get_string(&format!("Strip[{i}].device.name"))));
+        }
+        if watched.is_empty() { return; }
+        for (id, active) in events {
+            if !active && !self.s.engine_restart_on_disconnect { continue; }
+            let render = devices::is_render(&id);
+            let Some((name, iface)) = self.dev_names.get(&self.audio.en, &id) else { continue };
+            if let Some((_, label, _)) = watched.iter().find(|(r, _, dev)| *r == render && devices::bus_matches(dev, &name, &iface)) {
+                self.engine_reason = format!("{label} device {name} {}", if active { "connected" } else { "disconnected" });
+                unsafe { SetTimer(Some(self.hwnd), TIMER_ENGINE, ENGINE_DEBOUNCE_MS, None); } // re-arming restarts the wait
+            }
+        }
+    }
+
     fn restart_audio_service(&mut self) {
         log("restarting Windows audio service");
         std::thread::spawn(|| {
@@ -394,6 +448,7 @@ fn menu(h: HWND) -> usize {
         let m = CreatePopupMenu().unwrap();
         let _ = AppendMenuW(m, MF_STRING, ID_SETTINGS, w!("Settings"));
         let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(m, MF_STRING, ID_RESTART_ENGINE, w!("Restart Voicemeeter engine"));
         let _ = AppendMenuW(m, MF_STRING, ID_RESTART_VM, w!("Restart Voicemeeter"));
         let _ = AppendMenuW(m, MF_STRING, ID_RESTART_AUDIO, w!("Restart Windows audio"));
         let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
@@ -414,7 +469,12 @@ extern "system" fn wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     unsafe {
         match msg {
             WM_VOL => { with_app(|a| a.on_volume(true)); LRESULT(0) }
-            WM_DEVEVENT => { with_app(|a| a.last_dev_event = Instant::now()); LRESULT(0) }
+            WM_DEVEVENT => { with_app(|a| a.on_device_events()); LRESULT(0) }
+            WM_TIMER if w.0 == TIMER_ENGINE => {
+                let _ = KillTimer(Some(h), TIMER_ENGINE);
+                with_app(|a| { let why = std::mem::take(&mut a.engine_reason); a.restart_engine(&why); });
+                LRESULT(0)
+            }
             WM_REBIND => { with_app(|a| a.rebind()); LRESULT(0) }
             WM_AUDIO_RESTARTED => { with_app(|a| a.rebuild_audio()); LRESULT(0) }
             WM_SHOW_SETTINGS => { let _ = slint::invoke_from_event_loop(ui::open); LRESULT(0) }
@@ -425,6 +485,7 @@ extern "system" fn wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
                     WM_RBUTTONUP => match menu(h) {
                         ID_SETTINGS => { let _ = slint::invoke_from_event_loop(ui::open); }
                         ID_QUIT => { slint::quit_event_loop().ok(); }
+                        ID_RESTART_ENGINE => { with_app(|a| a.restart_engine("tray menu")); }
                         ID_RESTART_VM => { with_app(|a| a.restart_voicemeeter()); }
                         ID_RESTART_AUDIO => { with_app(|a| a.restart_audio_service()); }
                         _ => {}
@@ -467,7 +528,7 @@ fn main() -> Result<()> {
         let _ = TASKBAR_CREATED.set(RegisterWindowMessageW(w!("TaskbarCreated")));
 
         let s = Settings::load();
-        log(&format!("start {} admin={}", env!("CARGO_PKG_VERSION"), sys::is_admin()));
+        log(&format!("start {} admin={} crackle_fix={} priority={:#x} affinity={:#x} audiodg_pid={:?}", env!("CARGO_PKG_VERSION"), sys::is_admin(), s.crackle_fix, s.audiodg_priority, s.audiodg_affinity, sys::audiodg_pid()));
         // keep the plain startup entry pointing at this exe if it moved (the elevated task is only touched from settings)
         if s.start_with_windows && !s.start_as_admin {
             sys::apply_startup(true, false);
@@ -481,10 +542,11 @@ fn main() -> Result<()> {
         VOL_MUTED.store(muted, Ordering::Relaxed);
         let app = App {
             s, vm: Vm::load(), audio, hwnd: h, volume, muted, sent: None, connected: false, vm_name: "Voicemeeter",
-            last_dev_event: Instant::now(), audiodg_pid: None, audiodg_status: "not changed".into(), update_status: String::new(),
+            last_dev_event: Instant::now(), dev_names: devices::Names::default(), engine_reason: String::new(), audiodg_pid: None, audiodg_status: "not changed".into(), update_status: String::new(),
             last_update_check: None, updating: false, started: Instant::now(), settings_win: None,
         };
         STATE.with(|st| *st.borrow_mut() = Some(app));
+        with_app(|a| { let en = a.audio.en.clone(); a.dev_names.prefill(&en); });
         with_app(|a| {
             tray(h, NIM_ADD, "VMVolume");
             a.tick();

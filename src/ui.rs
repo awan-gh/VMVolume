@@ -33,6 +33,14 @@ pub fn open() {
             with_app(|a| read_back(&w, a));
         }
     });
+    let weak = w.as_weak();
+    w.on_engine_select_all(move |on| {
+        if let Some(w) = weak.upgrade() {
+            w.set_engine_buses(bools(vec![on; 5]));
+            w.set_engine_strips(bools(vec![on; 5]));
+            with_app(|a| read_back(&w, a));
+        }
+    });
     // Drop the window on close (after the callback returns) so its memory goes back.
     w.window().on_close_requested(|| {
         slint::Timer::single_shot(std::time::Duration::ZERO, || { with_app(|a| a.settings_win = None); crate::trim_memory(); });
@@ -50,10 +58,15 @@ fn fill(w: &SettingsWindow, a: &App) {
     w.set_limit_0(s.limit_db_gain_to_0);
     w.set_linear(s.linear_volume_scale);
     w.set_sync_mute(s.sync_mute);
+    w.set_mute_strips(bools((0..8).map(|i| s.mute_set().contains(&format!("Strip[{i}]"))).collect()));
+    w.set_mute_buses(bools((0..8).map(|i| s.mute_set().contains(&format!("Bus[{i}]"))).collect()));
     w.set_block_spikes(s.block_volume_spikes);
     w.set_strips(bools((0..8).map(|i| s.targets.contains(&format!("Strip[{i}]"))).collect()));
     w.set_buses(bools((0..8).map(|i| s.targets.contains(&format!("Bus[{i}]"))).collect()));
     w.set_crackle_fix(s.crackle_fix);
+    w.set_engine_buses(bools((0..5).map(|i| s.engine_restart_buses.get(i).copied().unwrap_or(false)).collect()));
+    w.set_engine_strips(bools((0..5).map(|i| s.engine_restart_strips.get(i).copied().unwrap_or(false)).collect()));
+    w.set_engine_on_disconnect(s.engine_restart_on_disconnect);
     w.set_priority(PRIORITY.iter().position(|&p| p == s.audiodg_priority).unwrap_or(0) as i32);
     let n = sys::cpu_count();
     w.set_core_labels(ModelRc::from(Rc::new(VecModel::from((0..n).map(|i| SharedString::from(format!("CPU {i}"))).collect::<Vec<_>>()))));
@@ -83,11 +96,19 @@ fn read_back(w: &SettingsWindow, a: &mut App) {
     s.limit_db_gain_to_0 = w.get_limit_0();
     s.linear_volume_scale = w.get_linear();
     s.sync_mute = w.get_sync_mute();
+    let mute: Vec<String> = read_bools(w.get_mute_strips()).iter().enumerate().filter(|(_, &on)| on).map(|(i, _)| format!("Strip[{i}]"))
+        .chain(read_bools(w.get_mute_buses()).iter().enumerate().filter(|(_, &on)| on).map(|(i, _)| format!("Bus[{i}]")))
+        .collect();
+    // keep following the volume targets until the mute list is actually made different
+    s.mute_targets = if old.mute_targets.is_none() && mute == s.targets { None } else { Some(mute) };
     s.block_volume_spikes = w.get_block_spikes();
     s.targets = read_bools(w.get_strips()).iter().enumerate().filter(|(_, &on)| on).map(|(i, _)| format!("Strip[{i}]"))
         .chain(read_bools(w.get_buses()).iter().enumerate().filter(|(_, &on)| on).map(|(i, _)| format!("Bus[{i}]")))
         .collect();
     s.crackle_fix = w.get_crackle_fix();
+    s.engine_restart_buses = read_bools(w.get_engine_buses());
+    s.engine_restart_strips = read_bools(w.get_engine_strips());
+    s.engine_restart_on_disconnect = w.get_engine_on_disconnect();
     s.audiodg_priority = PRIORITY[w.get_priority().clamp(0, 4) as usize];
     s.audiodg_affinity = read_bools(w.get_cores()).iter().enumerate().filter(|(_, &on)| on).fold(0u64, |m, (i, _)| m | 1 << i);
     s.start_with_windows = w.get_start_with_windows();
