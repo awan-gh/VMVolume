@@ -53,6 +53,7 @@ fn fill(w: &SettingsWindow, a: &App) {
     w.set_block_spikes(s.block_volume_spikes);
     w.set_strips(bools((0..8).map(|i| s.targets.contains(&format!("Strip[{i}]"))).collect()));
     w.set_buses(bools((0..8).map(|i| s.targets.contains(&format!("Bus[{i}]"))).collect()));
+    w.set_crackle_fix(s.crackle_fix);
     w.set_priority(PRIORITY.iter().position(|&p| p == s.audiodg_priority).unwrap_or(0) as i32);
     let n = sys::cpu_count();
     w.set_core_labels(ModelRc::from(Rc::new(VecModel::from((0..n).map(|i| SharedString::from(format!("CPU {i}"))).collect::<Vec<_>>()))));
@@ -72,6 +73,8 @@ pub fn refresh(w: &SettingsWindow, a: &App) {
     w.set_update_status(a.update_status.clone().into());
 }
 
+fn s_crackle_turned_off(old: &Settings, new: &Settings) -> bool { old.crackle_fix && !new.crackle_fix }
+
 fn read_back(w: &SettingsWindow, a: &mut App) {
     let old = a.s.clone();
     let mut s = old.clone();
@@ -84,6 +87,7 @@ fn read_back(w: &SettingsWindow, a: &mut App) {
     s.targets = read_bools(w.get_strips()).iter().enumerate().filter(|(_, &on)| on).map(|(i, _)| format!("Strip[{i}]"))
         .chain(read_bools(w.get_buses()).iter().enumerate().filter(|(_, &on)| on).map(|(i, _)| format!("Bus[{i}]")))
         .collect();
+    s.crackle_fix = w.get_crackle_fix();
     s.audiodg_priority = PRIORITY[w.get_priority().clamp(0, 4) as usize];
     s.audiodg_affinity = read_bools(w.get_cores()).iter().enumerate().filter(|(_, &on)| on).fold(0u64, |m, (i, _)| m | 1 << i);
     s.start_with_windows = w.get_start_with_windows();
@@ -94,10 +98,10 @@ fn read_back(w: &SettingsWindow, a: &mut App) {
     if (s.start_with_windows, s.start_as_admin) != (old.start_with_windows, old.start_as_admin) {
         sys::apply_startup(s.start_with_windows, s.start_as_admin);
     }
-    let adg_changed = (s.audiodg_priority, s.audiodg_affinity) != (old.audiodg_priority, old.audiodg_affinity);
+    let adg_changed = (s.crackle_fix, s.audiodg_priority, s.audiodg_affinity) != (old.crackle_fix, old.audiodg_priority, old.audiodg_affinity);
     s.save();
     a.s = s;
-    if adg_changed { a.apply_audiodg(); }
+    if s_crackle_turned_off(&old, &a.s) { a.reset_audiodg(); } else if adg_changed { a.apply_audiodg(); }
     a.sent = None; // targets or curve may have changed: push the current knob position again
     a.apply();
     refresh(w, a);

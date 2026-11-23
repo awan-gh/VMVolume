@@ -15,6 +15,8 @@ pub struct Settings {
     pub block_volume_spikes: bool,
     /// Voicemeeter targets, e.g. "Bus[0]", "Strip[3]".
     pub targets: Vec<String>,
+    /// Master switch for the audiodg.exe tweaks below ("crackle fix").
+    pub crackle_fix: bool,
     /// audiodg.exe priority class (Win32 value, e.g. 0x80 = High); 0 = leave alone.
     pub audiodg_priority: u32,
     /// audiodg.exe CPU affinity bitmask; 0 = leave alone.
@@ -28,7 +30,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             gain_min: -60.0, gain_max: 12.0, limit_db_gain_to_0: true, linear_volume_scale: false, sync_mute: true,
-            block_volume_spikes: true, targets: vec!["Bus[0]".into()], audiodg_priority: 0, audiodg_affinity: 0,
+            block_volume_spikes: true, targets: vec!["Bus[0]".into()], crackle_fix: true, audiodg_priority: 0, audiodg_affinity: 0,
             start_with_windows: true, start_as_admin: false, auto_update: true,
         }
     }
@@ -144,6 +146,6 @@ mod tests {
     fn old_settings_file_still_loads() {
         let s: Settings = serde_json::from_str(r#"{"gain_min":-40.0,"targets":["Bus[2]"]}"#).unwrap();
         assert_eq!(s.gain_min, -40.0);
-        assert!(s.auto_update);
+        assert!(s.auto_update && s.crackle_fix);
     }
 }

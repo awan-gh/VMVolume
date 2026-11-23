@@ -33,9 +33,12 @@ const WM_VOL: u32 = WM_APP + 2; // new value is in VOL_* atomics
 const WM_REBIND: u32 = WM_APP + 3; // default playback device changed
 const WM_DEVEVENT: u32 = WM_APP + 4; // any audio device added/removed/state change
 const WM_SHOW_SETTINGS: u32 = WM_APP + 5; // sent by a second launch
+const WM_AUDIO_RESTARTED: u32 = WM_APP + 6; // Windows audio service came back: rebuild our audio hooks
 const TIMER_TICK: usize = 1;
 const ID_SETTINGS: usize = 10;
 const ID_QUIT: usize = 11;
+const ID_RESTART_VM: usize = 12;
+const ID_RESTART_AUDIO: usize = 13;
 const UPDATE_EVERY: Duration = Duration::from_secs(6 * 3600);
 
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -244,7 +247,7 @@ impl App {
         // catch up on a volume message that was dropped while another handler ran
         self.on_volume(false);
         // audiodg restarts with the audio service: re-apply our tweaks to the new process
-        if self.s.audiodg_priority != 0 || self.s.audiodg_affinity != 0 {
+        if self.s.crackle_fix && (self.s.audiodg_priority != 0 || self.s.audiodg_affinity != 0) {
             let pid = sys::audiodg_pid();
             if pid != self.audiodg_pid { self.apply_audiodg(); }
         }
@@ -282,9 +285,51 @@ impl App {
 
     pub fn apply_audiodg(&mut self) {
         self.audiodg_pid = sys::audiodg_pid();
+        if !self.s.crackle_fix { self.audiodg_status = "crackle fix is off".into(); self.refresh_ui(); return; }
         self.audiodg_status = match sys::apply_audiodg(self.s.audiodg_priority, self.s.audiodg_affinity) { Ok(s) => s, Err(e) => e };
         log(&format!("audiodg: {}", self.audiodg_status));
         self.refresh_ui();
+    }
+
+    /// Turning the crackle fix off puts audiodg back to defaults right away.
+    pub fn reset_audiodg(&mut self) {
+        self.audiodg_status = match sys::reset_audiodg() { Ok(s) => s, Err(e) => e };
+        log(&format!("audiodg: {}", self.audiodg_status));
+        self.refresh_ui();
+    }
+
+    /// Close Voicemeeter cleanly (it saves its settings on shutdown), then start it again as the normal user.
+    fn restart_voicemeeter(&mut self) {
+        const EXES: [&str; 6] = ["voicemeeter8x64.exe", "voicemeeter8.exe", "voicemeeterpro_x64.exe", "voicemeeterpro.exe", "voicemeeter_x64.exe", "voicemeeter.exe"];
+        let running = sys::find_process(&EXES);
+        let path = running.as_ref().map(|(_, p)| p.clone()).or_else(|| {
+            let dir = voicemeeter_dir()?;
+            EXES.iter().map(|e| dir.join(e)).find(|p| p.exists())
+        });
+        let Some(path) = path else { log("restart Voicemeeter: not installed"); return };
+        if let (Some(vm), true) = (&self.vm, running.is_some()) { vm.run("Command.Shutdown=1;"); }
+        log(&format!("restarting Voicemeeter ({})", path.display()));
+        std::thread::spawn(move || {
+            if let Some((pid, _)) = running { sys::wait_or_kill(pid, 8); }
+            std::thread::sleep(Duration::from_millis(500));
+            sys::launch_unelevated(&path);
+        });
+    }
+
+    fn restart_audio_service(&mut self) {
+        log("restarting Windows audio service");
+        std::thread::spawn(|| {
+            let ok = sys::restart_audio_service();
+            log(&format!("Windows audio service restart: {}", if ok { "done" } else { "failed or cancelled" }));
+            std::thread::sleep(Duration::from_secs(2));
+            post(WM_AUDIO_RESTARTED);
+        });
+    }
+
+    /// The audio service restart invalidates our endpoint hooks: build them again.
+    fn rebuild_audio(&mut self) {
+        if let Ok(a) = Audio::new() { self.audio = a; }
+        self.rebind();
     }
 
     pub fn status_line(&self) -> String {
@@ -349,6 +394,9 @@ fn menu(h: HWND) -> usize {
         let m = CreatePopupMenu().unwrap();
         let _ = AppendMenuW(m, MF_STRING, ID_SETTINGS, w!("Settings"));
         let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(m, MF_STRING, ID_RESTART_VM, w!("Restart Voicemeeter"));
+        let _ = AppendMenuW(m, MF_STRING, ID_RESTART_AUDIO, w!("Restart Windows audio"));
+        let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(m, MF_STRING, ID_QUIT, w!("Quit"));
         let _ = SetMenuDefaultItem(m, ID_SETTINGS as u32, 0);
         let mut pt = POINT::default();
@@ -368,6 +416,7 @@ extern "system" fn wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
             WM_VOL => { with_app(|a| a.on_volume(true)); LRESULT(0) }
             WM_DEVEVENT => { with_app(|a| a.last_dev_event = Instant::now()); LRESULT(0) }
             WM_REBIND => { with_app(|a| a.rebind()); LRESULT(0) }
+            WM_AUDIO_RESTARTED => { with_app(|a| a.rebuild_audio()); LRESULT(0) }
             WM_SHOW_SETTINGS => { let _ = slint::invoke_from_event_loop(ui::open); LRESULT(0) }
             WM_TIMER if w.0 == TIMER_TICK => { with_app(|a| a.tick()); LRESULT(0) }
             WM_TRAY => {
@@ -376,6 +425,8 @@ extern "system" fn wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
                     WM_RBUTTONUP => match menu(h) {
                         ID_SETTINGS => { let _ = slint::invoke_from_event_loop(ui::open); }
                         ID_QUIT => { slint::quit_event_loop().ok(); }
+                        ID_RESTART_VM => { with_app(|a| a.restart_voicemeeter()); }
+                        ID_RESTART_AUDIO => { with_app(|a| a.restart_audio_service()); }
                         _ => {}
                     },
                     WM_LBUTTONDBLCLK | WM_LBUTTONUP => { let _ = slint::invoke_from_event_loop(ui::open); }

@@ -79,6 +79,7 @@ export component SettingsWindow inherits Window {
     in-out property <bool> block-spikes;
     in-out property <[bool]> strips;
     in-out property <[bool]> buses;
+    in-out property <bool> crackle-fix;
     in-out property <int> priority;
     in-out property <[bool]> cores;
     in property <[string]> core-labels;
@@ -135,11 +136,12 @@ export component SettingsWindow inherits Window {
             }
 
             Card {
-                title: "audiodg.exe";
-                subtitle: "The Windows audio engine process. Higher priority or pinning it to one core can stop crackling. Needs administrator.";
+                title: "Audio crackle fix";
+                subtitle: "Raises the priority of audiodg.exe (the Windows audio engine) and can pin it to chosen cores. Needs administrator.";
+                Row { label: "Crackle fix"; hint: "Off puts audiodg.exe back to Normal priority on all cores"; Switch { checked <=> root.crackle-fix; toggled => { root.changed(); } } }
                 Row {
                     label: "Priority";
-                    ComboBox { width: 160px; model: ["Don't change", "Normal", "Above normal", "High", "Realtime"]; current-index <=> root.priority; selected => { root.changed(); } }
+                    ComboBox { enabled: root.crackle-fix; width: 160px; model: ["Don't change", "Normal", "Above normal", "High", "Realtime"]; current-index <=> root.priority; selected => { root.changed(); } }
                 }
                 Text { text: "CPU cores (none ticked = don't change)"; font-size: 13px; }
                 ToggleGrid { labels: root.core-labels; values <=> root.cores; columns: 6; cell-width: 80px; edited => { root.changed(); } }

@@ -1,4 +1,5 @@
 //! Windows plumbing: audiodg tweaks, start-with-Windows (plain or elevated), elevation, single instance.
+use std::path::PathBuf;
 use windows::{
     core::*,
     Win32::{
@@ -96,6 +97,69 @@ pub fn apply_audiodg(priority: u32, affinity: u64) -> std::result::Result<String
         if affinity != 0 && SetProcessAffinityMask(h, affinity as usize).is_err() { err = Some("could not set affinity (no such core?)"); }
         let _ = CloseHandle(h);
         match err { Some(e) => Err(e.into()), None => Ok(format!("applied to audiodg.exe (pid {pid})")) }
+    }
+}
+
+/// Undo the crackle fix: Normal priority, all cores.
+pub fn reset_audiodg() -> std::result::Result<String, String> {
+    let pid = audiodg_pid().ok_or("audiodg.exe is not running")?;
+    if is_admin() { enable_debug_privilege(); }
+    unsafe {
+        let h = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, false, pid).map_err(|_| "needs administrator to reset audiodg.exe".to_string())?;
+        let (mut proc_mask, mut sys_mask) = (0usize, 0usize);
+        let _ = GetProcessAffinityMask(h, &mut proc_mask, &mut sys_mask);
+        let ok = SetPriorityClass(h, NORMAL_PRIORITY_CLASS).is_ok() && (sys_mask == 0 || SetProcessAffinityMask(h, sys_mask).is_ok());
+        let _ = CloseHandle(h);
+        if ok { Ok("crackle fix off: audiodg.exe back to Normal priority, all cores".into()) } else { Err("could not reset audiodg.exe".into()) }
+    }
+}
+
+/// Full path and pid of the first running process with one of these exe names.
+pub fn find_process(names: &[&str]) -> Option<(u32, PathBuf)> {
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut found = None;
+        if Process32FirstW(snap, &mut e).is_ok() {
+            loop {
+                let n = String::from_utf16_lossy(&e.szExeFile[..e.szExeFile.iter().position(|&c| c == 0).unwrap_or(0)]);
+                if names.iter().any(|x| n.eq_ignore_ascii_case(x)) { found = Some(e.th32ProcessID); break; }
+                if Process32NextW(snap, &mut e).is_err() { break; }
+            }
+        }
+        let _ = CloseHandle(snap);
+        let pid = found?;
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len).is_ok();
+        let _ = CloseHandle(h);
+        ok.then(|| (pid, PathBuf::from(String::from_utf16_lossy(&buf[..len as usize]))))
+    }
+}
+
+/// Wait up to `secs` for a process to exit; kill it if it does not.
+pub fn wait_or_kill(pid: u32, secs: u32) {
+    unsafe {
+        let Ok(h) = OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, pid) else { return };
+        if WaitForSingleObject(h, secs * 1000) != WAIT_OBJECT_0 { let _ = TerminateProcess(h, 1); let _ = WaitForSingleObject(h, 3000); }
+        let _ = CloseHandle(h);
+    }
+}
+
+/// Start a program through Explorer so it runs as the normal (non-elevated) user even when we are elevated.
+pub fn launch_unelevated(path: &std::path::Path) -> bool {
+    std::process::Command::new("explorer.exe").arg(path).spawn().is_ok()
+}
+
+/// Restart the Windows Audio service (also restarts audiodg.exe). Blocks until done; asks for UAC when not elevated.
+pub fn restart_audio_service() -> bool {
+    let script = "/c net stop audiosrv /y & net start audiosrv";
+    if is_admin() {
+        std::process::Command::new("cmd").raw_args(script).creation_flags_hidden().status().map(|s| s.success()).unwrap_or(false)
+    } else {
+        let ps = format!("Start-Process cmd -ArgumentList '{script}' -Verb RunAs -WindowStyle Hidden -Wait");
+        std::process::Command::new("powershell").args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps]).creation_flags_hidden().status().map(|s| s.success()).unwrap_or(false)
     }
 }
 
