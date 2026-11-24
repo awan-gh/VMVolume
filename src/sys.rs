@@ -163,6 +163,41 @@ pub fn restart_audio_service() -> bool {
     }
 }
 
+/// Windows 11 keeps each tray icon's "show in taskbar" choice under HKCU\Control Panel\NotifyIconSettings.
+/// Turn ours on the first time only (IsPromoted absent), so a later choice by the user is respected.
+/// Returns true once our entry was found.
+pub fn promote_tray_icon() -> bool {
+    let me = exe().to_lowercase();
+    unsafe {
+        let mut root = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, w!(r"Control Panel\NotifyIconSettings"), Some(0), KEY_READ, &mut root).is_err() { return false; }
+        let mut found = false;
+        for i in 0.. {
+            let mut name = [0u16; 64];
+            let mut len = name.len() as u32;
+            if RegEnumKeyExW(root, i, Some(PWSTR(name.as_mut_ptr())), &mut len, None, None, None, None).is_err() { break; }
+            let mut sub = HKEY::default();
+            if RegOpenKeyExW(root, PCWSTR(name.as_ptr()), Some(0), KEY_READ | KEY_SET_VALUE, &mut sub).is_err() { continue; }
+            let mut buf = [0u16; 1024];
+            let mut blen = (buf.len() * 2) as u32;
+            let path = if RegGetValueW(sub, None, w!("ExecutablePath"), RRF_RT_REG_SZ, None, Some(buf.as_mut_ptr() as _), Some(&mut blen)).is_ok() {
+                String::from_utf16_lossy(&buf[..buf.iter().position(|&c| c == 0).unwrap_or(0)]).to_lowercase()
+            } else { String::new() };
+            if path == me {
+                found = true;
+                if RegGetValueW(sub, None, w!("IsPromoted"), RRF_RT_REG_DWORD, None, None, None).is_err() {
+                    let one = 1u32.to_le_bytes();
+                    let _ = RegSetValueExW(sub, w!("IsPromoted"), Some(0), REG_DWORD, Some(&one));
+                }
+            }
+            let _ = RegCloseKey(sub);
+            if found { break; }
+        }
+        let _ = RegCloseKey(root);
+        found
+    }
+}
+
 pub fn cpu_count() -> usize { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(64) }
 
 // ---------- start with Windows ----------

@@ -227,6 +227,10 @@ pub struct App {
     last_update_check: Option<Instant>,
     updating: bool,
     started: Instant,
+    /// "still running in the tray" note already shown this session
+    close_hint_shown: bool,
+    /// pinned our tray icon out of the ^ overflow (or gave up)
+    tray_promoted: bool,
     pub settings_win: Option<ui::SettingsWindow>,
 }
 
@@ -270,6 +274,10 @@ impl App {
         if self.s.crackle_fix && (self.s.audiodg_priority != 0 || self.s.audiodg_affinity != 0) {
             let pid = sys::audiodg_pid();
             if pid != self.audiodg_pid { self.apply_audiodg(); }
+        }
+        // Windows 11 hides new tray icons under ^: show ours once Explorer has registered it (first minute only)
+        if !self.tray_promoted && self.started.elapsed() > Duration::from_secs(4) {
+            self.tray_promoted = sys::promote_tray_icon() || self.started.elapsed() > Duration::from_secs(60);
         }
         // updates: first check 30 s after start, then every 6 h
         let due = match self.last_update_check { None => self.started.elapsed() > Duration::from_secs(30), Some(t) => t.elapsed() > UPDATE_EVERY };
@@ -386,6 +394,13 @@ impl App {
         self.rebind();
     }
 
+    /// Closing the settings window keeps the app running: say so the first time.
+    pub fn on_settings_closed(&mut self) {
+        if self.close_hint_shown { return; }
+        self.close_hint_shown = true;
+        balloon(self.hwnd, "VMVolume is still running", "It keeps syncing your volume from the tray. Right-click the tray icon to quit.");
+    }
+
     pub fn status_line(&self) -> String {
         let conn = if self.connected { format!("Connected to {}", self.vm_name) } else { "Waiting for Voicemeeter…".into() };
         let admin = if sys::is_admin() { " · administrator" } else { "" };
@@ -429,6 +444,18 @@ pub fn start_update_check(a: &mut App, manual: bool) {
 }
 
 // ---------- tray + window ----------
+/// Small notification from the tray icon.
+fn balloon(h: HWND, title: &str, text: &str) {
+    let mut d = NOTIFYICONDATAW { cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32, hWnd: h, uID: 1, ..Default::default() };
+    d.uFlags = NIF_INFO;
+    d.dwInfoFlags = NIIF_INFO;
+    let t: Vec<u16> = title.encode_utf16().take(d.szInfoTitle.len() - 1).collect();
+    d.szInfoTitle[..t.len()].copy_from_slice(&t);
+    let b: Vec<u16> = text.encode_utf16().take(d.szInfo.len() - 1).collect();
+    d.szInfo[..b.len()].copy_from_slice(&b);
+    unsafe { let _ = Shell_NotifyIconW(NIM_MODIFY, &d); }
+}
+
 fn tray(h: HWND, op: NOTIFY_ICON_MESSAGE, tip: &str) {
     let mut d = NOTIFYICONDATAW { cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32, hWnd: h, uID: 1, ..Default::default() };
     d.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
@@ -543,7 +570,7 @@ fn main() -> Result<()> {
         let app = App {
             s, vm: Vm::load(), audio, hwnd: h, volume, muted, sent: None, connected: false, vm_name: "Voicemeeter",
             last_dev_event: Instant::now(), dev_names: devices::Names::default(), engine_reason: String::new(), audiodg_pid: None, audiodg_status: "not changed".into(), update_status: String::new(),
-            last_update_check: None, updating: false, started: Instant::now(), settings_win: None,
+            last_update_check: None, updating: false, started: Instant::now(), settings_win: None, close_hint_shown: false, tray_promoted: false,
         };
         STATE.with(|st| *st.borrow_mut() = Some(app));
         with_app(|a| { let en = a.audio.en.clone(); a.dev_names.prefill(&en); });

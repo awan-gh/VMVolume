@@ -43,7 +43,7 @@ pub fn open() {
     });
     // Drop the window on close (after the callback returns) so its memory goes back.
     w.window().on_close_requested(|| {
-        slint::Timer::single_shot(std::time::Duration::ZERO, || { with_app(|a| a.settings_win = None); crate::trim_memory(); });
+        slint::Timer::single_shot(std::time::Duration::ZERO, || { with_app(|a| { a.settings_win = None; a.on_settings_closed(); }); crate::trim_memory(); });
         slint::CloseRequestResponse::HideWindow
     });
     let _ = w.show();
