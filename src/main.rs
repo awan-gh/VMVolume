@@ -231,6 +231,8 @@ pub struct App {
     close_hint_shown: bool,
     /// pinned our tray icon out of the ^ overflow (or gave up)
     tray_promoted: bool,
+    /// the tray icon exists (adding fails while the taskbar is not up yet)
+    tray_added: bool,
     pub settings_win: Option<ui::SettingsWindow>,
 }
 
@@ -274,6 +276,11 @@ impl App {
         if self.s.crackle_fix && (self.s.audiodg_priority != 0 || self.s.audiodg_affinity != 0) {
             let pid = sys::audiodg_pid();
             if pid != self.audiodg_pid { self.apply_audiodg(); }
+        }
+        // the taskbar may not exist yet right after logon: keep trying until the icon is there
+        if !self.tray_added {
+            self.tray_added = tray(self.hwnd, NIM_ADD, &self.status_line().replace('\n', " · "));
+            if self.tray_added { log("tray icon added (retry)"); }
         }
         // Windows 11 hides new tray icons under ^: show ours once Explorer has registered it (first minute only)
         if !self.tray_promoted && self.started.elapsed() > Duration::from_secs(4) {
@@ -456,7 +463,7 @@ fn balloon(h: HWND, title: &str, text: &str) {
     unsafe { let _ = Shell_NotifyIconW(NIM_MODIFY, &d); }
 }
 
-fn tray(h: HWND, op: NOTIFY_ICON_MESSAGE, tip: &str) {
+fn tray(h: HWND, op: NOTIFY_ICON_MESSAGE, tip: &str) -> bool {
     let mut d = NOTIFYICONDATAW { cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32, hWnd: h, uID: 1, ..Default::default() };
     d.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     d.uCallbackMessage = WM_TRAY;
@@ -467,7 +474,7 @@ fn tray(h: HWND, op: NOTIFY_ICON_MESSAGE, tip: &str) {
     };
     let w: Vec<u16> = tip.encode_utf16().take(d.szTip.len() - 1).collect();
     d.szTip[..w.len()].copy_from_slice(&w);
-    unsafe { let _ = Shell_NotifyIconW(op, &d); }
+    unsafe { Shell_NotifyIconW(op, &d).as_bool() }
 }
 
 fn menu(h: HWND) -> usize {
@@ -524,7 +531,8 @@ extern "system" fn wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
             }
             _ if Some(&msg) == TASKBAR_CREATED.get() => { // Explorer restarted
                 let tip = with_app(|a| a.status_line().replace('\n', " · ")).unwrap_or_default();
-                tray(h, NIM_ADD, &tip);
+                let ok = tray(h, NIM_ADD, &tip);
+                with_app(|a| a.tray_added = ok);
                 LRESULT(0)
             }
             _ => DefWindowProcW(h, msg, w, l),
@@ -552,7 +560,11 @@ fn main() -> Result<()> {
         MAIN_HWND.store(h.0 as isize, Ordering::Relaxed);
         // let a non-elevated second launch reach an elevated instance
         let _ = ChangeWindowMessageFilterEx(h, WM_SHOW_SETTINGS, MSGFLT_ALLOW, None);
-        let _ = TASKBAR_CREATED.set(RegisterWindowMessageW(w!("TaskbarCreated")));
+        let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
+        let _ = TASKBAR_CREATED.set(taskbar_created);
+        // Elevated: Windows drops Explorer's TaskbarCreated broadcast unless we allow it, and then the icon
+        // never comes back after logon (taskbar not ready yet) or an Explorer restart.
+        let _ = ChangeWindowMessageFilterEx(h, taskbar_created, MSGFLT_ALLOW, None);
 
         let s = Settings::load();
         log(&format!("start {} admin={} crackle_fix={} priority={:#x} affinity={:#x} audiodg_pid={:?}", env!("CARGO_PKG_VERSION"), sys::is_admin(), s.crackle_fix, s.audiodg_priority, s.audiodg_affinity, sys::audiodg_pid()));
@@ -570,12 +582,13 @@ fn main() -> Result<()> {
         let app = App {
             s, vm: Vm::load(), audio, hwnd: h, volume, muted, sent: None, connected: false, vm_name: "Voicemeeter",
             last_dev_event: Instant::now(), dev_names: devices::Names::default(), engine_reason: String::new(), audiodg_pid: None, audiodg_status: "not changed".into(), update_status: String::new(),
-            last_update_check: None, updating: false, started: Instant::now(), settings_win: None, close_hint_shown: false, tray_promoted: false,
+            last_update_check: None, updating: false, started: Instant::now(), settings_win: None, close_hint_shown: false, tray_promoted: false, tray_added: false,
         };
         STATE.with(|st| *st.borrow_mut() = Some(app));
         with_app(|a| { let en = a.audio.en.clone(); a.dev_names.prefill(&en); });
         with_app(|a| {
-            tray(h, NIM_ADD, "VMVolume");
+            a.tray_added = tray(h, NIM_ADD, "VMVolume");
+            log(&format!("tray icon added at start: {}", a.tray_added));
             a.tick();
             a.refresh_ui();
         });
